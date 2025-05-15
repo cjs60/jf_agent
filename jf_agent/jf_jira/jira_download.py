@@ -32,9 +32,48 @@ def run_jira_download(config: ValidatedConfig, ingest_config: IngestionConfig) -
     download_status = 'success'
     error_message = None
 
+    # Primary Jira connection attempt
+    try:
+        jira_connection = get_jira_connection_from_jf_ingest(ingest_config.jira_config)
+        # Test connection by making a simple API call
+        jira_connection.server_info()
+        logger.info("Successfully connected to primary Jira endpoint")
+    except (JIRAError, ConnectionError, TimeoutError) as e:
+        logger.warning(f"Failed to connect to primary Jira endpoint: {str(e)}")
+        
+        # Attempt to connect to fallback endpoint if configured
+        if hasattr(ingest_config.jira_config, 'fallback_server') and ingest_config.jira_config.fallback_server:
+            logger.info(f"Attempting to connect to fallback Jira endpoint: {ingest_config.jira_config.fallback_server}")
+            try:
+                # Store the original server URL
+                original_server = ingest_config.jira_config.server
+                
+                # Temporarily swap to fallback server
+                ingest_config.jira_config.server = ingest_config.jira_config.fallback_server
+                jira_connection = get_jira_connection_from_jf_ingest(ingest_config.jira_config)
+                
+                # Test fallback connection
+                jira_connection.server_info()
+                logger.info("Successfully connected to fallback Jira endpoint")
+                
+                # Mark that we're using the fallback
+                ingest_config.jira_config.using_fallback = True
+                ingest_config.jira_config.original_server = original_server
+            except Exception as fallback_error:
+                # Restore original server URL
+                ingest_config.jira_config.server = original_server
+                logger.error(f"Failed to connect to fallback Jira endpoint: {str(fallback_error)}")
+                download_status = 'failed'
+                error_message = f"Connection failed to both primary ({str(e)}) and fallback ({str(fallback_error)}) Jira endpoints"
+                return {'type': 'Jira', 'status': download_status, 'error_message': error_message}
+        else:
+            logger.error("No fallback Jira endpoint configured")
+            download_status = 'failed'
+            error_message = f"Connection failed to Jira endpoint: {str(e)}"
+            return {'type': 'Jira', 'status': download_status, 'error_message': error_message}
+
     # Not really sure what this print_all_jira_fields is or who still uses it.
     # Leaving it in for backwards compatibility
-    jira_connection = get_jira_connection_from_jf_ingest(ingest_config.jira_config)
     if config.run_mode_is_print_all_jira_fields:
         print_all_jira_fields(config, jira_connection)
 
@@ -66,6 +105,47 @@ def run_jira_download(config: ValidatedConfig, ingest_config: IngestionConfig) -
         logger.info(
             'Jira Download Complete',
         )
+    except (JIRAError, ConnectionError, TimeoutError) as conn_error:
+        # Handle connection-related errors specially
+        logger.error(f'Connection error during Jira data download: {conn_error}')
+        
+        # If we're already using the fallback, we can't try another fallback
+        if hasattr(ingest_config.jira_config, 'using_fallback') and ingest_config.jira_config.using_fallback:
+            download_status = 'failed'
+            error_message = f"Connection error during data download, already using fallback: {str(conn_error)}"
+        elif hasattr(ingest_config.jira_config, 'fallback_server') and ingest_config.jira_config.fallback_server:
+            # If we've connected but encounter errors during download, try using the fallback
+            logger.info("Attempting to download using fallback Jira endpoint")
+            try:
+                # Store original server URL if not already swapped
+                if not hasattr(ingest_config.jira_config, 'original_server'):
+                    ingest_config.jira_config.original_server = ingest_config.jira_config.server
+                
+                # Swap to fallback server
+                ingest_config.jira_config.server = ingest_config.jira_config.fallback_server
+                ingest_config.jira_config.using_fallback = True
+                
+                # Recreate connection and try again
+                jira_connection = get_jira_connection_from_jf_ingest(ingest_config.jira_config)
+                success = load_and_push_jira_to_s3(ingest_config)
+                download_status = 'success' if success else 'failed'
+                
+                if success:
+                    logger.info('Jira Download Complete using fallback endpoint')
+                else:
+                    error_message = "Download failed using fallback endpoint"
+            except Exception as fallback_download_error:
+                # Restore original configuration
+                if hasattr(ingest_config.jira_config, 'original_server'):
+                    ingest_config.jira_config.server = ingest_config.jira_config.original_server
+                if hasattr(ingest_config.jira_config, 'using_fallback'):
+                    delattr(ingest_config.jira_config, 'using_fallback')
+                
+                download_status = 'failed'
+                error_message = f"Failed to download from fallback endpoint: {str(fallback_download_error)}"
+        else:
+            download_status = 'failed'
+            error_message = f"Connection error during data download, no fallback configured: {str(conn_error)}"
     except Exception as e:
         download_status = 'failed'
         error_message = str(e)
@@ -76,6 +156,12 @@ def run_jira_download(config: ValidatedConfig, ingest_config: IngestionConfig) -
         )
         logging_helper.send_to_agent_log_file(traceback.format_exc(), level=logging.ERROR)
     finally:
+        # Restore original server configuration if we used a fallback
+        if hasattr(ingest_config.jira_config, 'original_server'):
+            ingest_config.jira_config.server = ingest_config.jira_config.original_server
+        if hasattr(ingest_config.jira_config, 'using_fallback'):
+            delattr(ingest_config.jira_config, 'using_fallback')
+            
         return {'type': 'Jira', 'status': download_status, 'error_message': error_message}
 
 
