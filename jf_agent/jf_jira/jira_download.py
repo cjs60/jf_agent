@@ -169,7 +169,9 @@ def get_jira_connection_with_fallback(jira_config, fallback_url: Optional[str] =
                 
     # Primary connection failed, try fallback if provided
     if fallback_url:
-        logger.info(f"Primary connection failed. Attempting to connect to fallback JIRA endpoint: {fallback_url}")
+        # Create redacted URL for logging by removing potential credentials
+        redacted_url = fallback_url.split('@')[-1] if '@' in fallback_url else fallback_url
+        logger.info(f"Primary connection failed. Attempting to connect to fallback JIRA endpoint: {redacted_url}")
         # Save original URL
         original_url = jira_config.url
         
